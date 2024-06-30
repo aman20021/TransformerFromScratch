@@ -13,22 +13,11 @@ from datasets import load_dataset
 import os
 from pathlib import Path
 
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-
-def setup(rank, world_size):
-    # Initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-def cleanup():
-    dist.destroy_process_group()
-
 
 def get_config():
     return {
         "batch_size": 8,
-        "num_epochs": 50,
+        "num_epochs": 20,
         "lr": 10**-4,
         "seq_len": 500,
         "d_model": 512,
@@ -122,30 +111,29 @@ def get_ds():
 
 
 
-def train_model(rank, world_size):
-    setup(rank, world_size)
-    print("Using rank:", rank)
-    # device = "cuda" if torch.cuda.is_available() else "mps" if torch.has_mps or torch.backends.mps.is_available() else "cpu"
-    # print("Using device:", device)
-    # if (device == 'cuda'):
-    #     print(f"Device name: {torch.cuda.get_device_name(device.index)}")
-    #     print(f"Device memory: {torch.cuda.get_device_properties(device.index).total_memory / 1024 ** 3} GB")
-    # elif (device == 'mps'):
-    #     print(f"Device name: <mps>")
-    # else:
-    #     print("NOTE: If you have a GPU, consider using it for training.")
-    #     print("      On a Windows machine with NVidia GPU, check this video: https://www.youtube.com/watch?v=GMSjDTU8Zlc")
-    #     print("      On a Mac machine, run: pip3 install --pre torch torchvision torchaudio torchtext --index-url https://download.pytorch.org/whl/nightly/cpu")
-    # device = torch.device(device)
+def train_model():
+    
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.has_mps or torch.backends.mps.is_available() else "cpu"
+    print("Using device:", device)
+    if (device == 'cuda'):
+        print(f"Device name: {torch.cuda.get_device_name(device.index)}")
+        print(f"Device memory: {torch.cuda.get_device_properties(device.index).total_memory / 1024 ** 3} GB")
+    elif (device == 'mps'):
+        print(f"Device name: <mps>")
+    else:
+        print("NOTE: If you have a GPU, consider using it for training.")
+        print("      On a Windows machine with NVidia GPU, check this video: https://www.youtube.com/watch?v=GMSjDTU8Zlc")
+        print("      On a Mac machine, run: pip3 install --pre torch torchvision torchaudio torchtext --index-url https://download.pytorch.org/whl/nightly/cpu")
+    device = torch.device(device)
 
     # Make sure the weights folder exists
     Path(f"{config['datasource']}_{config['model_folder']}").mkdir(parents=True, exist_ok=True)
 
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds()
-    model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(rank)
+    model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     # Tensorboard
     writer = SummaryWriter(config['experiment_name'])
-    ddp_model = DDP(model, device_ids=[rank])
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
     
     initial_epoch = 0
@@ -155,7 +143,7 @@ def train_model(rank, world_size):
     if model_filename:
         print(f'Preloading model {model_filename}')
         state = torch.load(model_filename)
-        ddp_model.load_state_dict(state['model_state_dict'])
+        model.load_state_dict(state['model_state_dict'])
         initial_epoch = state['epoch'] + 1
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
@@ -166,7 +154,7 @@ def train_model(rank, world_size):
 
     for epoch in range(initial_epoch, config['num_epochs']):
         torch.cuda.empty_cache()
-        ddp_model.train()
+        model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
         for batch in batch_iterator:
 
@@ -176,9 +164,9 @@ def train_model(rank, world_size):
             decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
 
             # Run the tensors through the encoder, decoder and the projection layer
-            encoder_output = ddp_model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
-            decoder_output = ddp_model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
-            proj_output = ddp_model.project(decoder_output) # (B, seq_len, vocab_size)
+            encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
+            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
+            proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
 
             # Compare the output with the label
             label = batch['label'].to(device) # (B, seq_len)
@@ -204,17 +192,11 @@ def train_model(rank, world_size):
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
         torch.save({
             'epoch': epoch,
-            'model_state_dict': ddp_model.state_dict(),
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'global_step': global_step
         }, model_filename)
 
 
 
-    cleanup()
-
-if __name__ == '__main__':
-    warnings.filterwarnings("ignore")
-    world_size = torch.cuda.device_count() 
-    torch.multiprocessing.spawn(train_model, args=(world_size,), nprocs=world_size, join=True)
-
+train_model()
